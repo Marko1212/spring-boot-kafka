@@ -1,5 +1,8 @@
 package dev.lydtech.dispatch.integration;
 
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import dev.lydtech.dispatch.DispatchConfiguration;
 import dev.lydtech.dispatch.message.DispatchCompleted;
 import dev.lydtech.dispatch.message.DispatchPreparing;
@@ -11,6 +14,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cloud.contract.wiremock.AutoConfigureWireMock;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.annotation.KafkaHandler;
@@ -27,9 +31,8 @@ import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-
+import static com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED;
+import static dev.lydtech.dispatch.integration.WiremockUtils.stubWiremock;
 import static java.util.UUID.randomUUID;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -38,15 +41,14 @@ import static org.hamcrest.Matchers.notNullValue;
 
 @Slf4j
 @SpringBootTest(classes = {DispatchConfiguration.class})
+@AutoConfigureWireMock(port=0)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 @EmbeddedKafka(controlledShutdown = true)
 public class OrderDispatchIntegrationTest {
 
     private final static String ORDER_CREATED_TOPIC = "order.created";
-
     private final static String ORDER_DISPATCHED_TOPIC = "order.dispatched";
-
     private final static String DISPATCH_TRACKING_TOPIC = "dispatch.tracking";
 
     @Autowired
@@ -67,7 +69,7 @@ public class OrderDispatchIntegrationTest {
         @Bean
         public KafkaTestListener testListener() {
             return new KafkaTestListener();
-    }
+        }
     }
 
     /**
@@ -110,15 +112,62 @@ public class OrderDispatchIntegrationTest {
         testListener.orderDispatchedCounter.set(0);
         testListener.dispatchCompletedCounter.set(0);
 
+        WiremockUtils.reset();
+
         // Wait until the partitions are assigned.  The application listener container has one topic and the test
         // listener container has multiple topics, so take that into account when awaiting for topic assignment.
         registry.getListenerContainers().stream()
                 .forEach(container -> ContainerTestUtils.waitForAssignment(container,
                         container.getContainerProperties().getTopics().length * embeddedKafkaBroker.getPartitionsPerTopic()));
+
     }
 
+    /**
+     * Send in an order.created event and ensure the expected outbound events are emitted.  The call to the stock service
+     * is stubbed to return a 200 Success.
+     */
     @Test
-    public void testOrderDispatchFlow() throws Exception {
+    public void testOrderDispatchFlow_Success() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 200, "true");
+
+        OrderCreated orderCreated = TestEventData.buildOrderCreatedEvent(randomUUID(), "my-item");
+        sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
+
+        await().atMost(3, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.dispatchPreparingCounter::get, equalTo(1));
+        await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.orderDispatchedCounter::get, equalTo(1));
+        await().atMost(1, TimeUnit.SECONDS).pollDelay(100, TimeUnit.MILLISECONDS)
+                .until(testListener.dispatchCompletedCounter::get, equalTo(1));
+    }
+
+    /**
+     * The call to the stock service is stubbed to return a 400 Bad Request which results in a not-retryable exception
+     * being thrown, so the outbound events are never sent.
+     */
+    @Test
+    public void testOrderDispatchFlow_NotRetryableException() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 400, "Bad Request");
+
+        OrderCreated orderCreated = TestEventData.buildOrderCreatedEvent(randomUUID(), "my-item");
+        sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
+
+        TimeUnit.SECONDS.sleep(3);
+        assertThat(testListener.dispatchPreparingCounter.get(), equalTo(0));
+        assertThat(testListener.orderDispatchedCounter.get(), equalTo(0));
+        assertThat(testListener.dispatchCompletedCounter.get(), equalTo(0));
+    }
+
+    /**
+     * The call to the stock service is stubbed to initially return a 503 Service Unavailable response, resulting in a
+     * retryable exception being thrown.  On the subsequent attempt it is stubbed to then succeed, so the outbound events
+     * are sent.
+     */
+    @Test
+    public void testOrderDispatchFlow_RetryThenSuccess() throws Exception {
+        stubWiremock("/api/stock?item=my-item", 503, "Service unavailable", "failOnce", STARTED, "succeedNextTime");
+        stubWiremock("/api/stock?item=my-item", 200, "true", "failOnce", "succeedNextTime", "succeedNextTime");
+
         OrderCreated orderCreated = TestEventData.buildOrderCreatedEvent(randomUUID(), "my-item");
         sendMessage(ORDER_CREATED_TOPIC, randomUUID().toString(), orderCreated);
 
